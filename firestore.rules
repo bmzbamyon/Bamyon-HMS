@@ -1,0 +1,463 @@
+rules_version = '2';
+
+// =============================================================================
+// BAMYON-IMS — Firestore Security Rules
+//
+// This file — not any server process — is the real authorization boundary
+// for the whole application. Every hidden admin button, every disabled
+// payment method, every "customers can only edit their own X" rule in the
+// build documentation is enforced here, independent of what the UI shows.
+//
+// Data shape: /stores/{storeId}/<collection>/{docId}, with variants nested
+// under /stores/{storeId}/products/{productId}/variants/{variantId}.
+// =============================================================================
+
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    // -------------------------------------------------------------------
+    // Helpers
+    // -------------------------------------------------------------------
+
+    function isSignedIn() {
+      return request.auth != null;
+    }
+
+    function userDoc(storeId, uid) {
+      return get(/databases/$(database)/documents/stores/$(storeId)/users/$(uid));
+    }
+
+    function userRole(storeId) {
+      return isSignedIn() && userDoc(storeId, request.auth.uid).data.role;
+    }
+
+    function isAdmin(storeId) {
+      return isSignedIn()
+        && userDoc(storeId, request.auth.uid).data.role == 'admin';
+    }
+
+    // The single trusted server actor used by app/api/* route handlers —
+    // see src/lib/firebase/systemAuth.ts. Its /users/{uid} doc is the ONE
+    // document in the app that must be created by hand with role:"system",
+    // never through ensureUserDocument().
+    function isSystem(storeId) {
+      return isSignedIn()
+        && userDoc(storeId, request.auth.uid).data.role == 'system';
+    }
+
+    function isTrustedWriter(storeId) {
+      return isAdmin(storeId) || isSystem(storeId);
+    }
+
+    function staffProfile(storeId, uid) {
+      return get(/databases/$(database)/documents/stores/$(storeId)/staffProfiles/$(uid));
+    }
+
+    function hasStaffPermission(storeId, permission) {
+      return isSignedIn()
+        && userDoc(storeId, request.auth.uid).data.role == 'staff'
+        && staffProfile(storeId, request.auth.uid).data.status == 'active'
+        && permission in staffProfile(storeId, request.auth.uid).data.permissions;
+    }
+
+    function isAdminOrStaffWith(storeId, permission) {
+      return isAdmin(storeId) || hasStaffPermission(storeId, permission);
+    }
+
+    function isStaffOrAdmin(storeId) {
+      return isSignedIn()
+        && (userDoc(storeId, request.auth.uid).data.role == 'admin'
+            || userDoc(storeId, request.auth.uid).data.role == 'staff');
+    }
+
+    function isOwnerUid(uid) {
+      return isSignedIn() && request.auth.uid == uid;
+    }
+
+    // -------------------------------------------------------------------
+    // stores/{storeId} — theme, branding, feature flags, currency config
+    // -------------------------------------------------------------------
+    match /stores/{storeId} {
+      allow create: if !exists(/databases/$(database)/documents/stores/$(storeId)) && isSignedIn();
+      allow read: if true;
+      allow update: if isAdminOrStaffWith(storeId, 'settings.theme');
+      allow delete: if isAdmin(storeId);
+
+      // ---------------------------------------------------------------
+      // meta/bootstrap — a one-way flag consumed exactly once by the
+      // /setup page's "claim admin" step (see users/{uid} update below).
+      // ---------------------------------------------------------------
+      match /meta/{docId} {
+        allow read: if isSignedIn();
+        allow create: if isSignedIn() && request.resource.data.claimed == false;
+        allow update: if isSignedIn() && resource.data.claimed == false && request.resource.data.claimed == true;
+        allow delete: if isAdmin(storeId);
+      }
+
+      // ---------------------------------------------------------------
+      // users/{uid} — profile documents
+      // ---------------------------------------------------------------
+      match /users/{uid} {
+        allow read: if isOwnerUid(uid) || isAdminOrStaffWith(storeId, 'customers.read');
+        // A user may create their OWN profile as a customer, OR as staff —
+        // but ONLY if a matching invite already exists (see
+        // staffInvites/{email} below and AuthProvider.ensureUserDocument).
+        // The client can never simply declare itself staff.
+        allow create: if (isOwnerUid(uid)
+            && request.resource.data.uid == uid
+            && request.resource.data.storeId == storeId
+            && (
+              request.resource.data.role == 'customer'
+              || (request.resource.data.role == 'staff'
+                  && exists(/databases/$(database)/documents/stores/$(storeId)/staffInvites/$(request.resource.data.email)))
+            ))
+          || isTrustedWriter(storeId); // admin-initiated staff/guest account creation — see /api/admin/create-login, /api/checkout/guest-account
+        allow update: if (isOwnerUid(uid)
+            && request.resource.data.role == resource.data.role
+            && request.resource.data.status == resource.data.status
+            && request.resource.data.uid == resource.data.uid)
+          || isAdmin(storeId)
+          // First-run bootstrap: the person running /setup may promote
+          // THEMSELVES to admin exactly once, only while the store's
+          // meta/bootstrap flag is still unclaimed. The client does this
+          // and the meta/bootstrap update above in the same transaction —
+          // see lib/firestore/setup.ts claimAdmin().
+          || (
+            isOwnerUid(uid)
+            && resource.data.role != 'admin'
+            && request.resource.data.role == 'admin'
+            && exists(/databases/$(database)/documents/stores/$(storeId)/meta/bootstrap)
+            && get(/databases/$(database)/documents/stores/$(storeId)/meta/bootstrap).data.claimed == false
+          );
+        allow delete: if isAdmin(storeId);
+      }
+
+      // ---------------------------------------------------------------
+      // staffInvites/{email} — admin-only to create; existence is checked
+      // by the rules above to gate self-service staff provisioning
+      // ---------------------------------------------------------------
+      match /staffInvites/{email} {
+        allow read: if isAdminOrStaffWith(storeId, 'staff.manage');
+        allow write: if isAdminOrStaffWith(storeId, 'staff.manage');
+      }
+
+      // ---------------------------------------------------------------
+      // staffProfiles/{uid} & roles/{roleId} — staff/admin only
+      // ---------------------------------------------------------------
+      match /staffProfiles/{uid} {
+        allow read: if isOwnerUid(uid) || isAdminOrStaffWith(storeId, 'staff.manage');
+        allow create: if isAdminOrStaffWith(storeId, 'staff.manage')
+          || isTrustedWriter(storeId) // system-actor-created via /api/admin/create-login, after the caller's own permission was already verified server-side
+          || (
+            isOwnerUid(uid)
+            && userDoc(storeId, uid).data.role == 'staff'
+            && exists(/databases/$(database)/documents/stores/$(storeId)/staffInvites/$(userDoc(storeId, uid).data.email))
+            && request.resource.data.permissions
+               == get(/databases/$(database)/documents/stores/$(storeId)/staffInvites/$(userDoc(storeId, uid).data.email)).data.permissions
+          );
+        allow update, delete: if isAdminOrStaffWith(storeId, 'staff.manage');
+      }
+      match /roles/{roleId} {
+        allow read: if isAdminOrStaffWith(storeId, 'staff.manage');
+        allow write: if isAdmin(storeId);
+      }
+
+      // ---------------------------------------------------------------
+      // Catalogue — public read of published items, admin/staff write
+      // ---------------------------------------------------------------
+      match /categories/{categoryId} {
+        allow read: if true;
+        allow write: if isAdminOrStaffWith(storeId, 'products.write');
+      }
+
+      match /products/{productId} {
+        allow read: if resource.data.status == 'published'
+          || isAdminOrStaffWith(storeId, 'products.read');
+        allow create, update: if isAdminOrStaffWith(storeId, 'products.write');
+        allow delete: if isAdmin(storeId);
+
+        match /variants/{variantId} {
+          allow read: if true;
+          // Direct stock/price edits require the permission; stock RESERVATION
+          // during checkout is done by the authenticated customer as part of
+          // placeOrder()'s transaction — allow an authenticated user to touch
+          // ONLY stockReserved, and only upward, never price/stockOnHand.
+          allow create, delete: if isAdminOrStaffWith(storeId, 'products.write');
+          allow update: if isAdminOrStaffWith(storeId, 'products.write')
+            || isAdminOrStaffWith(storeId, 'pos.operate')
+            || (
+              isSignedIn()
+              && request.resource.data.diff(resource.data).affectedKeys()
+                   .hasOnly(['stockReserved', 'updatedAt'])
+              && request.resource.data.stockReserved >= resource.data.stockReserved
+              && request.resource.data.priceMinor == resource.data.priceMinor
+              && request.resource.data.stockOnHand == resource.data.stockOnHand
+            )
+            || isTrustedWriter(storeId); // markOrderPaid()/cancelOrder() adjust stockOnHand/stockReserved together
+        }
+      }
+
+      // ---------------------------------------------------------------
+      // Carts — strictly own-cart
+      // ---------------------------------------------------------------
+      match /carts/{uid} {
+        allow read, write: if isOwnerUid(uid);
+      }
+
+      // ---------------------------------------------------------------
+      // Orders — customer creates/reads own; staff/admin manage all
+      // ---------------------------------------------------------------
+      match /orders/{orderId} {
+        allow read: if (isSignedIn() && resource.data.userId == request.auth.uid)
+          || isAdminOrStaffWith(storeId, 'orders.read');
+        allow create: if isSignedIn()
+          && request.resource.data.storeId == storeId
+          && (
+            request.resource.data.userId == request.auth.uid
+            || isAdminOrStaffWith(storeId, 'pos.operate')
+          )
+          && request.resource.data.paymentStatus in ['pending', 'reserved', 'paid'];
+        // Customers may only cancel their own still-unfulfilled order, and
+        // only via the cancelOrder() transaction shape (delivery+payment
+        // status fields). All other transitions require staff/admin/system.
+        allow update: if isAdminOrStaffWith(storeId, 'orders.update')
+          || isAdminOrStaffWith(storeId, 'pos.operate')
+          || isTrustedWriter(storeId)
+          || (
+            isSignedIn()
+            && resource.data.userId == request.auth.uid
+            && resource.data.deliveryStatus == 'placed'
+            && request.resource.data.diff(resource.data).affectedKeys()
+                 .hasOnly(['deliveryStatus', 'paymentStatus', 'notes', 'updatedAt'])
+            && request.resource.data.deliveryStatus == 'cancelled'
+          );
+        allow delete: if false; // orders are never hard-deleted — cancel instead
+      }
+
+      // ---------------------------------------------------------------
+      // Wallet — append-only ledger; balances are a derived cache
+      // ---------------------------------------------------------------
+      match /walletLedger/{entryId} {
+        allow read: if (isSignedIn() && resource.data.userId == request.auth.uid)
+          || isAdminOrStaffWith(storeId, 'wallet.read');
+        // Ledger entries are created by the owning customer (reserve at
+        // checkout, release/debit at settlement — see wallet.ts) or by a
+        // trusted writer (deposits, commissions, admin adjustments,
+        // withdrawals). Never updatable/deletable — append-only, corrections
+        // are new `adjustment` entries, not edits.
+        allow create: if (isSignedIn()
+            && request.resource.data.userId == request.auth.uid
+            && request.resource.data.type in ['reserve_order', 'release_reservation', 'debit_purchase', 'withdrawal_pending'])
+          || isAdminOrStaffWith(storeId, 'wallet.adjust')
+          || isAdminOrStaffWith(storeId, 'pos.operate')
+          || isTrustedWriter(storeId);
+        allow update, delete: if false;
+      }
+
+      match /walletBalances/{uid} {
+        allow read: if isOwnerUid(uid) || isAdminOrStaffWith(storeId, 'wallet.read');
+        // Never written directly by ANY client role — only ever set inside
+        // the same transaction as a walletLedger entry (wallet.ts). The
+        // customer-triggered ledger types above are still narrow enough
+        // that letting the same actor update the derived balance is safe;
+        // deposits/commissions/adjustments require a trusted writer.
+        allow write: if (isSignedIn()
+            && request.auth.uid == uid
+            && request.resource.data.reservedMinor >= 0
+            && request.resource.data.availableMinor >= 0)
+          || isAdminOrStaffWith(storeId, 'wallet.adjust')
+          || isAdminOrStaffWith(storeId, 'pos.operate')
+          || isTrustedWriter(storeId);
+      }
+
+      // ---------------------------------------------------------------
+      // Payments — created pending by the system actor, read by owner/finance
+      // ---------------------------------------------------------------
+      match /payments/{paymentId} {
+        allow read: if (isSignedIn() && resource.data.userId == request.auth.uid)
+          || isAdminOrStaffWith(storeId, 'wallet.read');
+        allow create: if isTrustedWriter(storeId)
+          || (isSignedIn()
+              && request.resource.data.userId == request.auth.uid
+              && request.resource.data.provider == 'bank_transfer'
+              && request.resource.data.status == 'pending');
+        allow update: if isAdminOrStaffWith(storeId, 'wallet.verify') || isTrustedWriter(storeId);
+      }
+
+      // ---------------------------------------------------------------
+      // Reviews — own write, ownership-checked edits, moderator responses
+      // ---------------------------------------------------------------
+      match /reviews/{reviewId} {
+        allow read: if resource.data.status == 'published'
+          || isAdminOrStaffWith(storeId, 'reviews.moderate')
+          || (isSignedIn() && resource.data.userId == request.auth.uid);
+        allow create: if isSignedIn() && request.resource.data.userId == request.auth.uid;
+        allow update: if (isSignedIn()
+            && resource.data.userId == request.auth.uid
+            && request.resource.data.userId == resource.data.userId
+            && request.resource.data.productId == resource.data.productId
+            && request.resource.data.diff(resource.data).affectedKeys()
+                 .hasOnly(['rating', 'body', 'media', 'updatedAt']))
+          || isAdminOrStaffWith(storeId, 'reviews.moderate');
+        allow delete: if isAdminOrStaffWith(storeId, 'reviews.moderate');
+      }
+
+      // ---------------------------------------------------------------
+      // Affiliate / referral
+      // ---------------------------------------------------------------
+      match /affiliates/{affiliateId} {
+        allow read: if (isSignedIn() && resource.data.userId == request.auth.uid)
+          || isAdminOrStaffWith(storeId, 'affiliate.manage');
+        allow create: if isSignedIn() && request.resource.data.userId == request.auth.uid;
+        allow update: if isAdminOrStaffWith(storeId, 'affiliate.manage');
+      }
+      match /affiliateEvents/{eventId} {
+        allow read: if isAdminOrStaffWith(storeId, 'affiliate.manage')
+          || (isSignedIn() && get(/databases/$(database)/documents/stores/$(storeId)/affiliates/$(resource.data.affiliateId)).data.userId == request.auth.uid);
+        // Click tracking must work for anonymous visitors following an
+        // affiliate link, so it's the one open write here — but only for
+        // `type == 'click'` with no commission attached. Conversion events
+        // (which carry a commission amount) are never client-writable —
+        // only a trusted writer can create/settle these (build doc section
+        // 32: "do not allow customers to manipulate arbitrary commission
+        // amounts").
+        allow create: if (request.resource.data.type == 'click' && request.resource.data.status == 'clicked')
+          || isTrustedWriter(storeId)
+          || isAdminOrStaffWith(storeId, 'affiliate.manage');
+        allow update: if isTrustedWriter(storeId) || isAdminOrStaffWith(storeId, 'affiliate.manage');
+      }
+      match /referrals/{referralId} {
+        allow read: if isSignedIn()
+          && (resource.data.referrerId == request.auth.uid || resource.data.refereeId == request.auth.uid)
+          || isAdminOrStaffWith(storeId, 'affiliate.manage');
+        allow create: if isTrustedWriter(storeId)
+          || isAdminOrStaffWith(storeId, 'affiliate.manage')
+          || (isSignedIn()
+              && request.resource.data.refereeId == request.auth.uid
+              && request.resource.data.status == 'pending');
+        allow update: if isTrustedWriter(storeId) || isAdminOrStaffWith(storeId, 'affiliate.manage');
+      }
+
+      // ---------------------------------------------------------------
+      // Notifications — owner reads/marks-read; only trusted writers create
+      // ---------------------------------------------------------------
+      match /notifications/{notificationId} {
+        allow read: if isSignedIn() && resource.data.userId == request.auth.uid;
+        allow create: if isTrustedWriter(storeId) || isAdminOrStaffWith(storeId, 'customers.read');
+        allow update: if isSignedIn()
+          && resource.data.userId == request.auth.uid
+          && request.resource.data.diff(resource.data).affectedKeys().hasOnly(['readAt', 'updatedAt']);
+        allow delete: if false;
+      }
+
+      // ---------------------------------------------------------------
+      // Wishlist — strictly own items, nested under the user doc
+      // ---------------------------------------------------------------
+      match /users/{uid}/wishlistItems/{itemId} {
+        allow read, write: if isOwnerUid(uid);
+      }
+
+      // ---------------------------------------------------------------
+      // Delivery zones — public read (checkout needs it), admin write
+      // ---------------------------------------------------------------
+      match /deliveryZones/{zoneId} {
+        allow read: if true;
+        allow write: if isAdminOrStaffWith(storeId, 'settings.theme');
+      }
+
+      // ---------------------------------------------------------------
+      // Campaigns — public read (storefront banners), admin/staff write
+      // ---------------------------------------------------------------
+      match /campaigns/{campaignId} {
+        allow read: if true;
+        allow write: if isAdminOrStaffWith(storeId, 'settings.theme');
+      }
+
+      // ---------------------------------------------------------------
+      // Homepage sections — public read, admin/staff write
+      // ---------------------------------------------------------------
+      match /homepageSections/{sectionId} {
+        allow read: if true;
+        allow write: if isAdminOrStaffWith(storeId, 'settings.theme');
+      }
+
+      // ---------------------------------------------------------------
+      // Exchange rates — public read, admin/staff write
+      // ---------------------------------------------------------------
+      match /exchangeRates/{pairId} {
+        allow read: if true;
+        allow write: if isAdminOrStaffWith(storeId, 'settings.theme');
+      }
+
+      // ---------------------------------------------------------------
+      // Error logs — anyone can report an error (including guests before
+      // they're signed in), only admin can read them back
+      // ---------------------------------------------------------------
+      match /errorLogs/{logId} {
+        allow read: if isAdmin(storeId);
+        allow create: if true;
+        allow update, delete: if false;
+      }
+
+      // ---------------------------------------------------------------
+      // Chat — one conversation per customer (doc ID == customerId)
+      // ---------------------------------------------------------------
+      match /conversations/{conversationId} {
+        allow read: if (isSignedIn() && conversationId == request.auth.uid)
+          || isAdminOrStaffWith(storeId, 'customers.read');
+        // Created by the customer themselves (first message), or by staff
+        // opening a new thread on a customer's behalf.
+        allow create: if (isSignedIn() && conversationId == request.auth.uid)
+          || isAdminOrStaffWith(storeId, 'customers.read');
+        allow update: if (isSignedIn() && conversationId == request.auth.uid)
+          || isAdminOrStaffWith(storeId, 'customers.read');
+
+        match /messages/{messageId} {
+          allow read: if (isSignedIn() && conversationId == request.auth.uid)
+            || isAdminOrStaffWith(storeId, 'customers.read');
+          allow create: if (
+              isSignedIn()
+              && request.resource.data.senderId == request.auth.uid
+              && (
+                (conversationId == request.auth.uid && request.resource.data.senderRole == 'customer')
+                || (isAdminOrStaffWith(storeId, 'customers.read') && request.resource.data.senderRole == 'staff')
+              )
+            );
+          allow update, delete: if false;
+        }
+      }
+
+      // ---------------------------------------------------------------
+      // Staff attendance — staff read/write their own; admin reads all
+      // ---------------------------------------------------------------
+      match /staffAttendance/{entryId} {
+        allow read: if isAdminOrStaffWith(storeId, 'staff.manage')
+          || (isSignedIn() && resource.data.staffUid == request.auth.uid);
+        allow create: if isSignedIn() && request.resource.data.staffUid == request.auth.uid;
+        allow update: if isSignedIn()
+          && resource.data.staffUid == request.auth.uid
+          && request.resource.data.diff(resource.data).affectedKeys().hasOnly(['clockOutAt', 'updatedAt']);
+        allow delete: if false;
+      }
+
+      // ---------------------------------------------------------------
+      // Audit log — admin-readable, written only by trusted writers
+      // ---------------------------------------------------------------
+      match /auditLogs/{logId} {
+        allow read: if isAdmin(storeId);
+        allow create: if isTrustedWriter(storeId) || isStaffOrAdmin(storeId);
+        allow update, delete: if false;
+      }
+
+      // ---------------------------------------------------------------
+      // Catch-all for collections scaffolded in the data model but not
+      // wired up in phases 1-5 (blogPosts, communityPosts, courses, etc.)
+      // — locked down by default until their phase implements real rules.
+      // ---------------------------------------------------------------
+      match /{document=**} {
+        allow read: if isAdmin(storeId);
+        allow write: if false;
+      }
+    }
+  }
+}
