@@ -19,7 +19,7 @@ const STAGE_LABEL: Record<OrderDeliveryStatus, string> = {
   delivered: "Delivered",
   completed: "Completed",
   issue: "Issue — contact support",
-  cancelled: "Cancelled",
+  cancelled: "Cancelled/",
 };
 
 function OrdersPageContent() {
